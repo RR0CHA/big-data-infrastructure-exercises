@@ -1,8 +1,16 @@
 import os
 from typing import Annotated
-
-from fastapi import APIRouter, status
+#from fastapi import FastAPI, HTTPException, Query
+import requests
+import shutil
+from fastapi import APIRouter, status, HTTPException
 from fastapi.params import Query
+from bs4 import BeautifulSoup
+from urllib.request import urlopen, Request
+import gzip
+import json
+import csv
+import pandas as pd
 
 from bdi_api.settings import Settings
 
@@ -52,7 +60,64 @@ def download_data(
     base_url = settings.source_url + "/2023/11/01/"
     # TODO Implement download
 
+    """
+    Fetch a list of file URLs from an external source and download them.
+    The number of files downloaded is limited by the 'limit' query parameter.
+    """
+
+    if file_limit <= 0:
+        raise HTTPException(status_code=400, detail="Limit must be greater than 0")
+
+    # Fetch file URLs from the external API
+    try:
+
+        req = Request(url=base_url,headers={'user-agent': 'bdi_api/0.0.1'})
+        response = urlopen(req)  
+        html = BeautifulSoup(response, features="lxml")
+        elements = html.find_all(attrs={"class": "name"})
+        file_urls = []
+        for i in range(file_limit): # Limit the number of files
+            file_urls.append(base_url+elements[i].get_text())
+        #print("elements ====>> "+str(len(elements)))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch file URLs: {str(e)}")
+
+    if not file_urls:
+        raise HTTPException(status_code=404, detail="No files found to download.")
+
+    #print("download_dir: "+download_dir)
+
+    # Clear previous downloads
+    try:
+        shutil.rmtree(download_dir)
+    except FileNotFoundError as e:
+        #dir does not exist - no need to delete
+        pass
+
+    os.makedirs(download_dir, exist_ok=True)
+
+    
+    # Download files
+    downloaded_files = []
+    for idx, url in enumerate(file_urls):
+        try:
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+
+            # Extract filename and save locally
+            filename = os.path.basename(url)
+            save_path = os.path.join(download_dir, f"{filename}")
+            with open(save_path, "wb") as file:
+                shutil.copyfileobj(response.raw, file)
+
+            downloaded_files.append(save_path)
+        except Exception as e:
+            print(f"Failed to download {url}: {e}")
+            continue
+
+    #return str({"message": f"Downloaded {len(downloaded_files)} files successfully", "files": str(downloaded_files)})
     return "OK"
+    
 
 
 @s1.post("/aircraft/prepare")
@@ -75,6 +140,63 @@ def prepare_data() -> str:
     Keep in mind that we are downloading a lot of small files, and some libraries might not work well with this!
     """
     # TODO
+
+    download_dir = os.path.join(settings.raw_dir, "day=20231101")
+    prepared_dir = os.path.join(settings.prepared_dir, "day=20231101")
+
+    # Clear previous prepared folder
+    try:
+        shutil.rmtree(prepared_dir)
+    except FileNotFoundError as e:
+        #dir does not exist - no need to delete
+        pass
+
+    os.makedirs(prepared_dir, exist_ok=True)
+
+    #todo: check if download_dir exist
+    
+    # Iterate over all files in the folder
+    for file_name in os.listdir(download_dir):
+        if file_name.endswith(".gz"):
+            gz_file_path = os.path.join(download_dir, file_name)
+            #csv_file_name = os.path.splitext(file_name)[0] + ".csv"  # Generate CSV file name
+            #csv_file_path = os.path.join(prepared_dir, csv_file_name)
+
+            # Process the .gz file and write to its corresponding CSV file
+            #process_gz_file_to_csv(gz_file_path, csv_file_path)
+    
+            try:
+                with gzip.open(gz_file_path, 'rt', encoding='utf-8') as gz_file:
+                    # Parse the JSON content
+                    json_content = json.load(gz_file)
+                    # Extract the "data" field
+                    now_timestamp = json_content.get("now")
+                    csv_file_name = str(now_timestamp) + ".csv"  # Generate CSV file name
+                    csv_file_path = os.path.join(prepared_dir, csv_file_name)
+
+                    data = json_content.get("aircraft", [])
+
+                    if data:
+                        # Collect all unique field names from the entire data list
+                        fieldnames = set()
+                        for item in data:
+                            fieldnames.update(item.keys())
+                        fieldnames = sorted(fieldnames)  # Sort fieldnames to maintain order
+
+                        with open(csv_file_path, mode='w', newline='', encoding='utf-8') as csv_file:
+                            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                            writer.writeheader()
+
+                            for item in data:
+                                # Write each item, ensuring missing fields are handled
+                                writer.writerow({field: item.get(field, None) for field in fieldnames})
+
+                        #print(f"Data successfully written to {csv_file_path}")
+                    else:
+                        print(f"No data found in file {gz_file_path}")
+            except Exception as e:
+                print(f"Error processing file {gz_file_path}: {e}")
+
     return "OK"
 
 
@@ -84,7 +206,36 @@ def list_aircraft(num_results: int = 100, page: int = 0) -> list[dict]:
     icao asc
     """
     # TODO
-    return [{"icao": "0d8300", "registration": "YV3382", "type": "LJ31"}]
+    
+    prepared_dir = os.path.join(settings.prepared_dir, "day=20231101")
+    all_files = [os.path.join(prepared_dir, f) for f in os.listdir(prepared_dir) if f.endswith('.csv')]
+    dataframes = [pd.read_csv(file) for file in all_files]
+    data = pd.concat(dataframes, ignore_index=True)
+
+    data = data[['hex','r','t']]
+
+    # remove rows with null values in at least one column
+    data = data.dropna()
+
+    # remove duplicated rows
+    data = data.drop_duplicates()
+
+    # set fields per expected result
+    data.rename(columns={'hex': 'icao', 'r': 'registration', 't': 'type'}, inplace=True)
+
+    # sort by icao ascending
+    data = data.sort_values(by=data.columns[0])
+
+    # Implement pagination
+    start_idx = page * num_results
+    end_idx = start_idx + num_results
+    paginated_data = data.iloc[start_idx:end_idx]
+
+    # Convert the result to a list of dictionaries for JSON response
+    result = paginated_data.to_dict(orient="records")
+
+    return result
+    #return [{"icao": "0d8300", "registration": "YV3382", "type": "LJ31"}]
 
 
 @s1.get("/aircraft/{icao}/positions")
@@ -93,7 +244,49 @@ def get_aircraft_position(icao: str, num_results: int = 1000, page: int = 0) -> 
     If an aircraft is not found, return an empty list.
     """
     # TODO implement and return a list with dictionaries with those values.
-    return [{"timestamp": 1609275898.6, "lat": 30.404617, "lon": -86.476566}]
+    prepared_dir = os.path.join(settings.prepared_dir, "day=20231101")
+    #all_files = [os.path.join(prepared_dir, f) for f in os.listdir(prepared_dir) if f.endswith('.csv')]
+    all_files = [f for f in os.listdir(prepared_dir) if f.endswith('.csv')]
+    #dataframes = [pd.read_csv(os.path.join(prepared_dir, file)) for file in all_files]
+    dataframes = []
+    for file in all_files:
+        timestamp = file.partition('.csv')[0]
+        df = pd.read_csv(os.path.join(prepared_dir, file))
+        df['timestamp_file'] = float(timestamp)
+        dataframes.append(df)
+
+    data = pd.concat(dataframes, ignore_index=True)
+
+    data = data[['hex', 'timestamp_file', 'lat', 'lon', 'seen', 'seen_pos']]
+
+    data['timestamp'] = data['timestamp_file'] - data['seen_pos'] #seen_pos: how long ago (in seconds before “now”) the position was last updated
+
+    data = data[data['hex'] == icao]
+
+    data = data[['timestamp', 'lat', 'lon']]
+
+    # remove rows with null values in at least one column
+    #data = data.dropna()
+
+    # remove duplicated rows
+    #data = data.drop_duplicates()
+
+    # set fields per expected result
+    #data.rename(columns={'hex': 'icao', 'r': 'registration', 't': 'type'}, inplace=True)
+
+    # sort by icao ascending
+    data = data.sort_values(by=data.columns[0])
+
+    # Implement pagination
+    start_idx = page * num_results
+    end_idx = start_idx + num_results
+    paginated_data = data.iloc[start_idx:end_idx]
+
+    # Convert the result to a list of dictionaries for JSON response
+    result = paginated_data.to_dict(orient="records")
+
+    return result    
+    #return [{"timestamp": 1609275898.6, "lat": 30.404617, "lon": -86.476566}]
 
 
 @s1.get("/aircraft/{icao}/stats")
@@ -105,4 +298,69 @@ def get_aircraft_statistics(icao: str) -> dict:
     * had_emergency
     """
     # TODO Gather and return the correct statistics for the requested aircraft
-    return {"max_altitude_baro": 300000, "max_ground_speed": 493, "had_emergency": False}
+    prepared_dir = os.path.join(settings.prepared_dir, "day=20231101")
+    all_files = [os.path.join(prepared_dir, f) for f in os.listdir(prepared_dir) if f.endswith('.csv')]
+    dataframes = [pd.read_csv(file) for file in all_files]
+    data = pd.concat(dataframes, ignore_index=True)
+
+    data = data[['hex','alt_baro','gs','emergency']]
+
+    data = data[data['hex'] == icao]
+
+    result = {}
+
+    max_alt_baro = data[data['alt_baro'] != "ground"]['alt_baro'].astype(float).max()
+    result['max_altitude_baro'] = max_alt_baro
+    #print("max_alt_baro: "+str(max_alt_baro))
+
+    max_gs = data['gs'].max()
+    result['max_ground_speed'] = max_gs
+    #print("max_gs: "+str(max_gs))
+
+    #had_emergency = data['emergency'].notnull().any()
+    had_emergency = not data['emergency'].apply(lambda x: pd.isnull(x) or str(x).strip().lower() == 'none').all()
+    result['had_emergency'] = str(had_emergency)
+    
+    #print("had_emmergency: "+str(had_emergency))
+
+
+    # remove rows with null values in at least one column
+    #data = data.dropna()
+
+    # remove duplicated rows
+    #data = data.drop_duplicates()
+
+    # set fields per expected result
+    #data.rename(columns={'hex': 'icao', 'r': 'registration', 't': 'type'}, inplace=True)
+
+    # sort by icao ascending
+    #data = data.sort_values(by=data.columns[0])
+    #first_data = data.iloc[0]
+
+    # Convert the result to a list of dictionaries for JSON response
+    #result = first_data.to_dict()
+
+    return result
+    #return {"max_altitude_baro": 300000, "max_ground_speed": 493, "had_emergency": False}
+
+@s1.get("/aircraft/{icao}/stats2")
+def get_aircraft_stats2(icao: str, num_results: int = 1000, page: int = 0) -> list[dict]:
+ 
+    prepared_dir = os.path.join(settings.prepared_dir, "day=20231101")
+    all_files = [os.path.join(prepared_dir, f) for f in os.listdir(prepared_dir) if f.endswith('.csv')]
+    dataframes = [pd.read_csv(file) for file in all_files]
+    data = pd.concat(dataframes, ignore_index=True)
+
+    data = data[['hex','alt_baro','gs','emergency']]
+
+    data = data[data['hex'] == icao]
+
+    # Implement pagination
+    start_idx = page * num_results
+    end_idx = start_idx + num_results
+    paginated_data = data.iloc[start_idx:end_idx]
+
+    # Convert the result to a list of dictionaries for JSON response
+    result = paginated_data.to_dict(orient="records")
+
+    return result
