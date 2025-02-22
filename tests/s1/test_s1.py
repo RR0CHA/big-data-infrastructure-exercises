@@ -46,7 +46,7 @@ class TestS1Student:
         with client as client:
             response = client.get(f"/api/s1/aircraft/{icao}/stats")
             r = response.json()
-            assert r['had_emergency'] == 'False', "icao does not exist"
+            assert r['had_emergency'] is False, "icao does not exist"
             assert r['max_altitude_baro'] is None, "icao does not exist"
             assert r['max_ground_speed'] is None, "icao does not exist"
 
