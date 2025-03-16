@@ -1,9 +1,13 @@
 from os.path import dirname, join
 
+from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 import bdi_api
+
+# Load environment variables from .env file
+load_dotenv()
 
 PROJECT_DIR = dirname(dirname(bdi_api.__file__))
 
@@ -15,8 +19,17 @@ class DBCredentials(BaseSettings):
     port: int = 5432
     username: str
     password: str
+    database: str
     model_config = SettingsConfigDict(env_prefix="bdi_db_")
 
+#class AWSCredentials(BaseSettings):
+#    """Load AWS credentials from environment variables"""
+
+#    aws_access_key_id: str
+#    aws_secret_access_key: str
+#    aws_session_token: str
+
+#    model_config = SettingsConfigDict(env_prefix="AWS_")
 
 class Settings(BaseSettings):
     source_url: str = Field(
@@ -28,7 +41,7 @@ class Settings(BaseSettings):
         description="For any other value set env variable 'BDI_LOCAL_DIR'",
     )
     s3_bucket: str = Field(
-        default="bdi-test",
+        default="bdi-aircraft-01",
         description="Call the api like `BDI_S3_BUCKET=yourbucket poetry run uvicorn...`",
     )
 
