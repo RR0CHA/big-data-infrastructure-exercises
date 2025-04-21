@@ -54,7 +54,7 @@ class TestItCanBeEvaluated:
 
     def test_co2(self, client: TestClient) -> None:
         icao = "a7f3ab"
-        day="2024-10-01"
+        day="2023-10-31"
         with client as client:
             response = client.get(f"/api/s8/aircraft/{icao}/co2?day={day}")
             assert not response.is_error, "Error at the positions endpoint"
